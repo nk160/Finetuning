@@ -1,5 +1,18 @@
 import torch
 import whisper
+import wandb
+
+# Initialize wandb
+wandb.init(
+    project="whisper-fine-tuning",
+    name="whisper-10epochs",
+    config={
+        "epochs": 10,
+        "learning_rate": 1e-5,
+        "model_type": "tiny.en",
+        "ground_truth": "Hello, my name is Izaak."
+    }
+)
 
 # Load the model
 model = whisper.load_model("tiny.en")
@@ -31,24 +44,55 @@ input_tks = torch.cat([sot_token, target_tensor], dim=-1)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
 criterion = torch.nn.CrossEntropyLoss()
 
-# Train the model for 10 epochs instead of 5
+# Modified training loop with wandb logging
 model.train()
-for step in range(10):  # Changed from 5 to 10 epochs
-    # Forward pass
-    predictions = model(tokens=input_tks, mel=mel) # teacher forcing!
-    remove_sot = input_tks[:, 1:] # remove SOT token to align targets with predictions
-    predictions = predictions[:, :-1, :] # remove the last prediction again for alignment
+for step in range(10):
+    predictions = model(tokens=input_tks, mel=mel)
+    remove_sot = input_tks[:, 1:]
+    predictions = predictions[:, :-1, :]
     loss = criterion(predictions.transpose(1, 2), remove_sot)
 
-    # Backward pass
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    print(f"Step {step+1}/10, Loss: {loss.item():.4f}")  # Updated step count in print
+    # Log metrics to wandb
+    wandb.log({
+        "epoch": step + 1,
+        "loss": loss.item(),
+    })
+    print(f"Step {step+1}/10, Loss: {loss.item():.4f}")
 
-# Test the model
+# Test and log final results
 model.eval()
 torch.set_grad_enabled(False)
 result = model.transcribe(audio_path)
-print("Transcription:", result["text"]) 
+wandb.log({
+    "final_transcription": result["text"],
+    "initial_transcription": result["text"]  # Need to store this at start
+})
+
+# Save model weights as W&B Artifact
+model_artifact = wandb.Artifact(
+    name=f"whisper_model_10epoch",
+    type="model",
+    description="Whisper model fine-tuned for 10 epochs"
+)
+
+# Save the model weights
+model_path = "whisper_10epoch.pt"
+torch.save({
+    'epoch': 10,
+    'model_state_dict': model.state_dict(),
+    'optimizer_state_dict': optimizer.state_dict(),
+    'loss': loss.item(),
+}, model_path)
+
+# Add the model file to the artifact
+model_artifact.add_file(model_path)
+
+# Log the artifact to W&B
+wandb.log_artifact(model_artifact)
+
+# Close wandb run
+wandb.finish() 
