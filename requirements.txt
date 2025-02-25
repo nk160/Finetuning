@@ -6,4 +6,4 @@ wandb
 datasets
 transformers
 evaluate
-jiwer  # for WER calculation 
+jiwer  # for WER calculation optuna
