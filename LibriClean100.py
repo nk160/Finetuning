@@ -12,6 +12,7 @@ import json
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
 import evaluate
+from datasets import config
 
 # Global model configuration
 MODEL_NAME = "openai/whisper-tiny.en"
@@ -20,13 +21,13 @@ processor = WhisperProcessor.from_pretrained(MODEL_NAME)
 # W&B setup
 wandb.init(
     project="whisper-fine-tuning",
-    name="librispeech-clean-100-lr2e-5",
+    name="librispeech-clean-100-test",
     config={
         "dataset": "train-clean-100",
         "model_type": "tiny.en",
         "batch_size": 32,
         "learning_rate": 2e-5,
-        "epochs": 5,
+        "epochs": 1,
         "validation_steps": 100,
         "max_audio_length": 30,  # maximum audio length in seconds
         "sampling_rate": 16000,
@@ -270,17 +271,16 @@ class ModelCheckpointer:
             print(f"New best WER: {current_wer:.4f}")
 
 def objective(trial):
-    # Define the hyperparameter search space
     config = {
         "dataset": "train-clean-100",
         "model_type": "tiny.en",
-        "batch_size": trial.suggest_int("batch_size", 16, 64, step=8),
-        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 5e-5, log=True),
-        "epochs": 5,
+        "batch_size": 32,
+        "learning_rate": 2e-5,
+        "epochs": 1,
         "validation_steps": 100,
         "max_audio_length": 30,
         "sampling_rate": 16000,
-        "gradient_accumulation_steps": trial.suggest_int("gradient_accumulation_steps", 1, 4)
+        "gradient_accumulation_steps": 2
     }
     
     # Initialize W&B for this trial
@@ -298,8 +298,18 @@ def objective(trial):
         processor = WhisperProcessor.from_pretrained(model_name)
         model = WhisperForConditionalGeneration.from_pretrained(model_name).to(device)
         
+        # Set a longer timeout
+        config.HF_DATASETS_TIMEOUT = 1000  # 1000 seconds
+
+        # Try downloading with explicit cache directory
+        dataset = load_dataset(
+            "librispeech_asr",
+            "clean",
+            data_dir="./data/LibriSpeech/LibriSpeech",
+            cache_dir="./data"
+        )
+        
         # Prepare datasets with trial-specific batch size
-        dataset = load_dataset("librispeech_asr", "clean")
         train_loader, val_loader = prepare_dataset(dataset, processor, config["batch_size"])
         
         # Training setup
@@ -354,7 +364,12 @@ def main():
     model = WhisperForConditionalGeneration.from_pretrained(MODEL_NAME).to(device)
     
     # Load dataset
-    dataset = load_dataset("librispeech_asr", "clean")
+    dataset = load_dataset(
+        "librispeech_asr",
+        "clean",
+        data_dir="./data/LibriSpeech/LibriSpeech",
+        cache_dir="./data"
+    )
     train_loader, val_loader = prepare_dataset(dataset, processor, wandb.config.batch_size)
     
     # Training setup
@@ -369,8 +384,8 @@ def main():
         study_name="whisper-librispeech-optimization"
     )
     
-    # Run optimization
-    study.optimize(objective, n_trials=20)
+    # Run optimization with 1 trial instead of 20
+    study.optimize(objective, n_trials=1)
     
     # Print and save results
     print("Best trial:")
