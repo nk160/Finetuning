@@ -2,4 +2,8 @@ torch
 torchaudio
 openai-whisper
 numpy<2.0
-wandb 
+wandb
+datasets
+transformers
+evaluate
+jiwer  # for WER calculation 
