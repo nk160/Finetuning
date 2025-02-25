@@ -1,8 +1,7 @@
 import torch
-import whisper
 import wandb
 import optuna
-from datasets import load_dataset
+from datasets import load_dataset, DatasetDict
 from jiwer import wer
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
@@ -10,6 +9,13 @@ from tqdm.auto import tqdm
 from torch.cuda.amp import autocast, GradScaler
 import os
 import json
+from transformers import WhisperProcessor, WhisperForConditionalGeneration
+from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
+import evaluate
+
+# Global model configuration
+MODEL_NAME = "openai/whisper-tiny.en"
+processor = WhisperProcessor.from_pretrained(MODEL_NAME)
 
 # W&B setup
 wandb.init(
@@ -30,9 +36,9 @@ wandb.init(
 
 class LibriSpeechDataset(Dataset):
     """Custom Dataset for LibriSpeech"""
-    def __init__(self, dataset, split="train"):
+    def __init__(self, dataset, processor, split="train"):
         self.dataset = dataset[split]
-        self.processor = whisper.pad_or_trim
+        self.processor = processor
         
     def __len__(self):
         return len(self.dataset)
@@ -40,37 +46,43 @@ class LibriSpeechDataset(Dataset):
     def __getitem__(self, idx):
         item = self.dataset[idx]
         audio = item['audio']['array']
-        # Ensure audio is the right length
-        audio = whisper.pad_or_trim(audio)
-        # Convert to mel spectrogram
-        mel = whisper.log_mel_spectrogram(audio)
+        # Process audio using Whisper processor
+        inputs = self.processor(
+            audio, 
+            sampling_rate=16000, 
+            return_tensors="pt"
+        )
+        # Get text and process it
+        labels = self.processor(
+            text=item['text'],
+            return_tensors="pt"
+        ).input_ids
+        
         return {
-            'input_features': mel,
-            'labels': item['text']
+            'input_features': inputs.input_features.squeeze(),
+            'labels': labels.squeeze()
         }
 
-def prepare_dataset(batch_size):
+def prepare_dataset(dataset, processor, batch_size):
     """Load and prepare LibriSpeech dataset"""
-    dataset = load_dataset("librispeech_asr", "clean")
-    train_dataset = LibriSpeechDataset(dataset, "train.100")
-    val_dataset = LibriSpeechDataset(dataset, "validation")
+    train_dataset = LibriSpeechDataset(dataset, processor, "train.clean.100")
+    val_dataset = LibriSpeechDataset(dataset, processor, "validation.clean")
     
     # Increase workers based on CPU cores
-    num_workers = min(16, os.cpu_count())  # Use up to 16 workers
+    num_workers = min(16, os.cpu_count())
     
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,  # Increased
-        pin_memory=True,
-        prefetch_factor=2
+        num_workers=num_workers,
+        pin_memory=True
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size * 2,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,  # Increased
+        num_workers=num_workers,
         pin_memory=True
     )
     
@@ -95,7 +107,7 @@ def log_gpu_memory():
             "gpu_memory_reserved_gb": reserved
         })
 
-def train_epoch(model, train_loader, optimizer, criterion, device, scaler):
+def train_epoch(model, train_loader, optimizer, device, scaler):
     try:
         model.train()
         total_loss = 0
@@ -104,26 +116,26 @@ def train_epoch(model, train_loader, optimizer, criterion, device, scaler):
         optimizer.zero_grad()
         for i, batch in enumerate(progress_bar):
             try:
-                mel = batch['input_features'].to(device, non_blocking=True)
-                labels = batch['labels']
+                # Move input features to device
+                input_features = batch['input_features'].to(device, non_blocking=True)
+                labels = batch['labels'].to(device, non_blocking=True)
                 
-                # Get tokenized labels
-                tokenizer = whisper.tokenizer.get_tokenizer(model.is_multilingual)
-                target_ids = [tokenizer.encode(text) for text in labels]
-                target_ids = torch.tensor(target_ids, device=device)
-                
-                # Forward pass
+                # Forward pass with mixed precision
                 with autocast():
-                    output = model(mel)
+                    outputs = model(
+                        input_features=input_features,
+                        labels=labels
+                    )
                 
-                # Compute loss
-                loss = criterion(output.transpose(1, 2), target_ids)
+                # Get loss from model outputs
+                loss = outputs.loss / wandb.config.gradient_accumulation_steps
                 
-                loss = loss / wandb.config.gradient_accumulation_steps  # Scale loss
-                loss.backward()
+                # Backward pass with gradient scaling
+                scaler.scale(loss).backward()
                 
                 if (i + 1) % wandb.config.gradient_accumulation_steps == 0:
                     scaler.step(optimizer)
+                    scaler.update()
                     optimizer.zero_grad()
                 
                 total_loss += loss.item()
@@ -134,6 +146,7 @@ def train_epoch(model, train_loader, optimizer, criterion, device, scaler):
                 
                 if (i + 1) % 100 == 0:  # Log every 100 batches
                     log_gpu_memory()
+                    
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
                 print(f"OOM error in batch {i}. Skipping batch...")
@@ -147,20 +160,30 @@ def train_epoch(model, train_loader, optimizer, criterion, device, scaler):
 def validate(model, val_loader, device):
     torch.cuda.empty_cache()  # Clear GPU cache before validation
     model.eval()
+    total_wer = 0
     all_predictions = []
     all_references = []
     
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Validating"):
-            mel = batch['input_features'].to(device)
+            input_features = batch['input_features'].to(device)
+            labels = batch['labels'].to(device)
             
-            # Get model predictions
-            result = model.transcribe(mel)
-            predictions = result["text"]
+            # Generate predictions
+            generated_ids = model.generate(
+                input_features=input_features,
+                max_length=256,
+                num_beams=5
+            )
             
-            all_predictions.extend(predictions)
-            all_references.extend(batch['labels'])
+            # Decode predictions and references
+            transcriptions = processor.batch_decode(generated_ids, skip_special_tokens=True)
+            references = processor.batch_decode(labels, skip_special_tokens=True)
+            
+            all_predictions.extend(transcriptions)
+            all_references.extend(references)
     
+    # Compute metrics
     metrics = compute_metrics(all_predictions, all_references)
     return metrics
 
@@ -269,16 +292,18 @@ def objective(trial):
     )
     
     try:
-        # Setup model and training
+        # Setup model and training using HuggingFace implementation
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = whisper.load_model("tiny.en").to(device)
+        model_name = "openai/whisper-tiny.en"
+        processor = WhisperProcessor.from_pretrained(model_name)
+        model = WhisperForConditionalGeneration.from_pretrained(model_name).to(device)
         
         # Prepare datasets with trial-specific batch size
-        train_loader, val_loader = prepare_dataset(config["batch_size"])
+        dataset = load_dataset("librispeech_asr", "clean")
+        train_loader, val_loader = prepare_dataset(dataset, processor, config["batch_size"])
         
         # Training setup
         optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
-        criterion = torch.nn.CrossEntropyLoss()
         scaler = GradScaler()
         early_stopping = EarlyStopping(patience=1, min_delta=0.001)
         
@@ -286,7 +311,7 @@ def objective(trial):
         
         # Training loop
         for epoch in range(config["epochs"]):
-            train_loss = train_epoch(model, train_loader, optimizer, criterion, device, scaler)
+            train_loss = train_epoch(model, train_loader, optimizer, device, scaler)
             val_metrics = validate(model, val_loader, device)
             
             current_wer = val_metrics["wer"]
@@ -309,6 +334,34 @@ def objective(trial):
         raise e
 
 def main():
+    # Initialize wandb first
+    wandb.init(
+        project="whisper-fine-tuning",
+        name="librispeech-clean-100",
+        config={
+            "model_name": MODEL_NAME,
+            "dataset": "train-clean-100",
+            "batch_size": 8,
+            "learning_rate": 1e-5,
+            "max_steps": 4000,
+            "warmup_steps": 500,
+            "gradient_accumulation_steps": 2,
+        }
+    )
+
+    # Setup model and training
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = WhisperForConditionalGeneration.from_pretrained(MODEL_NAME).to(device)
+    
+    # Load dataset
+    dataset = load_dataset("librispeech_asr", "clean")
+    train_loader, val_loader = prepare_dataset(dataset, processor, wandb.config.batch_size)
+    
+    # Training setup
+    optimizer = torch.optim.Adam(model.parameters(), lr=wandb.config.learning_rate)
+    scaler = GradScaler()
+    checkpointer = ModelCheckpointer(wandb.run)
+    
     # Create Optuna study
     study = optuna.create_study(
         direction="minimize",
@@ -317,9 +370,9 @@ def main():
     )
     
     # Run optimization
-    study.optimize(objective, n_trials=20)  # Adjust number of trials as needed
+    study.optimize(objective, n_trials=20)
     
-    # Print results
+    # Print and save results
     print("Best trial:")
     trial = study.best_trial
     print(f"  Value (WER): {trial.value}")
@@ -331,6 +384,8 @@ def main():
     best_params = study.best_params
     with open("best_params.json", "w") as f:
         json.dump(best_params, f)
+    
+    wandb.finish()
 
 if __name__ == "__main__":
     main() 
