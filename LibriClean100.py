@@ -1,6 +1,7 @@
 import torch
 import whisper
 import wandb
+import optuna
 from datasets import load_dataset
 from jiwer import wer
 import numpy as np
@@ -8,6 +9,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 from torch.cuda.amp import autocast, GradScaler
 import os
+import json
 
 # W&B setup
 wandb.init(
@@ -47,7 +49,7 @@ class LibriSpeechDataset(Dataset):
             'labels': item['text']
         }
 
-def prepare_dataset():
+def prepare_dataset(batch_size):
     """Load and prepare LibriSpeech dataset"""
     dataset = load_dataset("librispeech_asr", "clean")
     train_dataset = LibriSpeechDataset(dataset, "train.100")
@@ -58,7 +60,7 @@ def prepare_dataset():
     
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=wandb.config.batch_size,
+        batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,  # Increased
         pin_memory=True,
@@ -66,7 +68,7 @@ def prepare_dataset():
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=wandb.config.batch_size * 2,
+        batch_size=batch_size * 2,
         shuffle=False,
         num_workers=num_workers,  # Increased
         pin_memory=True
@@ -244,85 +246,91 @@ class ModelCheckpointer:
             self.save_checkpoint(model, optimizer, epoch, train_loss, val_metrics, is_best=True)
             print(f"New best WER: {current_wer:.4f}")
 
-def main():
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True  # Optimize CUDA operations
-        current_device = torch.cuda.current_device()
-        print(f"Using GPU: {torch.cuda.get_device_name(current_device)}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(current_device).total_memory / 1e9:.2f} GB")
+def objective(trial):
+    # Define the hyperparameter search space
+    config = {
+        "dataset": "train-clean-100",
+        "model_type": "tiny.en",
+        "batch_size": trial.suggest_int("batch_size", 16, 64, step=8),
+        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 5e-5, log=True),
+        "epochs": 5,
+        "validation_steps": 100,
+        "max_audio_length": 30,
+        "sampling_rate": 16000,
+        "gradient_accumulation_steps": trial.suggest_int("gradient_accumulation_steps", 1, 4)
+    }
     
-    # Setup device
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Initialize W&B for this trial
+    wandb.init(
+        project="whisper-fine-tuning-optuna",
+        name=f"trial_{trial.number}",
+        config=config,
+        reinit=True
+    )
     
-    # Load model
-    model = whisper.load_model("tiny.en")
-    model = model.to(device)
-    
-    # Prepare datasets
-    train_loader, val_loader = prepare_dataset()
-    
-    # Setup training
-    optimizer = torch.optim.Adam(model.parameters(), lr=wandb.config.learning_rate)
-    criterion = torch.nn.CrossEntropyLoss()
-    
-    # Add gradient scaler for mixed precision
-    scaler = GradScaler()
-    
-    # Add checkpoint recovery
-    start_epoch = 0
     try:
-        checkpoint = torch.load('latest_checkpoint.pt')
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch']
-        print(f"Resuming from epoch {start_epoch}")
-    except FileNotFoundError:
-        print("Starting training from scratch")
+        # Setup model and training
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = whisper.load_model("tiny.en").to(device)
+        
+        # Prepare datasets with trial-specific batch size
+        train_loader, val_loader = prepare_dataset(config["batch_size"])
+        
+        # Training setup
+        optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
+        criterion = torch.nn.CrossEntropyLoss()
+        scaler = GradScaler()
+        early_stopping = EarlyStopping(patience=1, min_delta=0.001)
+        
+        best_wer = float('inf')
+        
+        # Training loop
+        for epoch in range(config["epochs"]):
+            train_loss = train_epoch(model, train_loader, optimizer, criterion, device, scaler)
+            val_metrics = validate(model, val_loader, device)
+            
+            current_wer = val_metrics["wer"]
+            trial.report(current_wer, epoch)
+            
+            # Update best WER
+            if current_wer < best_wer:
+                best_wer = current_wer
+            
+            # Early stopping check
+            early_stopping(current_wer)
+            if early_stopping.should_stop or trial.should_prune():
+                break
+        
+        wandb.finish()
+        return best_wer
     
-    # Initialize checkpointer
-    checkpointer = ModelCheckpointer(wandb.run)
-    
-    # Initialize early stopping
-    early_stopping = EarlyStopping(patience=1, min_delta=0.001)
-    
-    # Training loop
-    for epoch in range(start_epoch, wandb.config.epochs):
-        print(f"\nEpoch {epoch+1}/{wandb.config.epochs}")
-        
-        # Train
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device, scaler)
-        
-        # Validate
-        val_metrics = validate(model, val_loader, device)
-        
-        # Log enhanced metrics
-        wandb.log({
-            "epoch": epoch + 1,
-            "train_loss": train_loss,
-            "val_wer": val_metrics["wer"],
-            "num_words_reference": val_metrics["num_words_reference"],
-            "num_words_hypothesis": val_metrics["num_words_hypothesis"],
-            "avg_sequence_length": val_metrics["avg_sequence_length"],
-            "learning_rate": optimizer.param_groups[0]['lr']
-        })
-        
-        # Save checkpoints
-        checkpointer.check_and_save(model, optimizer, epoch, train_loss, val_metrics)
-        
-        # Early stopping check
-        early_stopping(val_metrics["wer"])
-        if early_stopping.should_stop:
-            print(f"Early stopping triggered after epoch {epoch+1}")
-            break
+    except Exception as e:
+        wandb.finish()
+        raise e
 
-    # Final training summary
-    print("\nTraining Summary:")
-    print(f"Best WER: {checkpointer.best_wer:.4f}")
-    print(f"Total Epochs Run: {epoch+1}")
-    print(f"Final Training Loss: {train_loss:.4f}")
-    print(f"Dataset Split Used: train-clean-100 (28539 samples)")
+def main():
+    # Create Optuna study
+    study = optuna.create_study(
+        direction="minimize",
+        pruner=optuna.pruners.MedianPruner(),
+        study_name="whisper-librispeech-optimization"
+    )
     
-    wandb.finish()
+    # Run optimization
+    study.optimize(objective, n_trials=20)  # Adjust number of trials as needed
+    
+    # Print results
+    print("Best trial:")
+    trial = study.best_trial
+    print(f"  Value (WER): {trial.value}")
+    print("  Params: ")
+    for key, value in trial.params.items():
+        print(f"    {key}: {value}")
+    
+    # Save best parameters
+    best_params = study.best_params
+    with open("best_params.json", "w") as f:
+        json.dump(best_params, f)
 
 if __name__ == "__main__":
     main() 
