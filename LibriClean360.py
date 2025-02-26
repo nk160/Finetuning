@@ -12,6 +12,7 @@ import json
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
 import evaluate
+import aiohttp
 
 # Global model configuration
 MODEL_NAME = "openai/whisper-tiny.en"
@@ -44,24 +45,39 @@ class LibriSpeechDataset(Dataset):
         return len(self.dataset)
     
     def __getitem__(self, idx):
-        item = self.dataset[idx]
-        audio = item['audio']['array']
-        # Process audio using Whisper processor
-        inputs = self.processor(
-            audio, 
-            sampling_rate=16000, 
-            return_tensors="pt"
-        )
-        # Get text and process it
-        labels = self.processor(
-            text=item['text'],
-            return_tensors="pt"
-        ).input_ids
-        
-        return {
-            'input_features': inputs.input_features.squeeze(),
-            'labels': labels.squeeze()
-        }
+        try:
+            item = self.dataset[idx]
+            audio = item['audio']['array']
+            
+            if len(audio) == 0:
+                raise ValueError("Empty audio file encountered")
+            
+            # Process inputs with attention mask
+            inputs = self.processor(
+                audio, 
+                sampling_rate=16000, 
+                return_tensors="pt",
+                return_attention_mask=True
+            )
+            
+            # Process text with max length constraint
+            labels = self.processor.tokenizer(
+                text=item['text'],
+                return_tensors="pt",
+                padding="max_length",
+                max_length=448,
+                truncation=True,
+                return_attention_mask=True
+            )
+            
+            return {
+                'input_features': inputs.input_features.squeeze(),
+                'attention_mask': inputs.attention_mask.squeeze(),
+                'labels': labels.input_ids.squeeze()
+            }
+        except Exception as e:
+            print(f"Error processing item {idx}: {str(e)}")
+            raise e
 
 def prepare_dataset(dataset, processor, batch_size):
     """Load and prepare LibriSpeech dataset"""
@@ -114,6 +130,51 @@ class ModelCheckpointer:
             'timestamp': wandb.run.start_time,
             'run_id': wandb.run.id
         }
+        
+        checkpoint_path = f"checkpoint_epoch_{epoch+1}"
+        if is_best:
+            checkpoint_path += "_best"
+            
+        torch.save(checkpoint, checkpoint_path + ".pt")
+        
+        model_artifact = wandb.Artifact(
+            name=checkpoint_path,
+            type="model",
+            description=f"Whisper model fine-tuned on LibriSpeech Clean 360 - Epoch {epoch+1}" + 
+                       (" (Best)" if is_best else "")
+        )
+        
+        model_artifact.add_file(checkpoint_path + ".pt")
+        self.wandb_run.log_artifact(model_artifact)
+        
+    def check_and_save(self, model, optimizer, epoch, train_loss, val_metrics):
+        current_wer = val_metrics["wer"]
+        
+        self.save_checkpoint(model, optimizer, epoch, train_loss, val_metrics)
+        
+        if current_wer < self.best_wer:
+            self.best_wer = current_wer
+            self.save_checkpoint(model, optimizer, epoch, train_loss, val_metrics, is_best=True)
+            print(f"New best WER: {current_wer:.4f}")
+
+class EarlyStopping:
+    def __init__(self, patience=3, min_delta=0.001):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.should_stop = False
+
+    def __call__(self, val_loss):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+        elif val_loss > self.best_loss - self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
+        else:
+            self.best_loss = val_loss
+            self.counter = 0
 
 def compute_metrics(pred_texts, ref_texts):
     """Compute WER and additional metrics"""
@@ -242,8 +303,21 @@ def objective(trial):
         model = WhisperForConditionalGeneration.from_pretrained(model_name).to(device)
         
         # Load dataset
-        dataset = load_dataset("librispeech_asr", "clean")
-        train_loader, val_loader = prepare_dataset(dataset, processor, config["batch_size"])
+        train_dataset = load_dataset(
+            "librispeech_asr",
+            "clean",
+            split="train.360",
+            trust_remote_code=True,
+            storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}},
+        )
+        val_dataset = load_dataset(
+            "librispeech_asr",
+            "clean",
+            split="validation",
+            trust_remote_code=True,
+            storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}},
+        )
+        train_loader, val_loader = prepare_dataset(train_dataset, processor, config["batch_size"])
         
         # Training setup
         optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
@@ -294,8 +368,21 @@ def main():
     model = WhisperForConditionalGeneration.from_pretrained(MODEL_NAME).to(device)
     
     # Load dataset
-    dataset = load_dataset("librispeech_asr", "clean")
-    train_loader, val_loader = prepare_dataset(dataset, processor, wandb.config.batch_size)
+    train_dataset = load_dataset(
+        "librispeech_asr",
+        "clean",
+        split="train.360",
+        trust_remote_code=True,
+        storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}},
+    )
+    val_dataset = load_dataset(
+        "librispeech_asr",
+        "clean",
+        split="validation",
+        trust_remote_code=True,
+        storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}},
+    )
+    train_loader, val_loader = prepare_dataset(train_dataset, processor, wandb.config.batch_size)
     
     # Training setup
     optimizer = torch.optim.Adam(model.parameters(), lr=wandb.config.learning_rate)
