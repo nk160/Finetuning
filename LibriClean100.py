@@ -1,6 +1,7 @@
 import torch
 import wandb
 import optuna
+import aiohttp
 from datasets import load_dataset, DatasetDict
 from jiwer import wer
 import numpy as np
@@ -45,49 +46,71 @@ class LibriSpeechDataset(Dataset):
         return len(self.dataset)
     
     def __getitem__(self, idx):
-        item = self.dataset[idx]
-        audio = item['audio']['array']
-        # Process audio using Whisper processor
-        inputs = self.processor(
-            audio, 
-            sampling_rate=16000, 
-            return_tensors="pt"
-        )
-        # Get text and process it
-        labels = self.processor(
-            text=item['text'],
-            return_tensors="pt"
-        ).input_ids
-        
-        return {
-            'input_features': inputs.input_features.squeeze(),
-            'labels': labels.squeeze()
-        }
+        try:
+            item = self.dataset[idx]
+            audio = item['audio']['array']
+            
+            # Add audio length check
+            if len(audio) == 0:
+                raise ValueError("Empty audio file encountered")
+                
+            # Process audio using Whisper processor
+            inputs = self.processor(
+                audio, 
+                sampling_rate=16000, 
+                return_tensors="pt",
+                padding=True
+            )
+            
+            # Get text and process it
+            labels = self.processor(
+                text=item['text'],
+                return_tensors="pt",
+                padding=True
+            ).input_ids
+            
+            return {
+                'input_features': inputs.input_features.squeeze(),
+                'labels': labels.squeeze()
+            }
+        except Exception as e:
+            print(f"Error processing item {idx}: {str(e)}")
+            # Return a dummy item or skip
+            raise e
 
 def prepare_dataset(dataset, processor, batch_size):
     """Load and prepare LibriSpeech dataset"""
-    train_dataset = LibriSpeechDataset(dataset, processor, "train.clean.100")
-    val_dataset = LibriSpeechDataset(dataset, processor, "validation.clean")
-    
-    # Increase workers based on CPU cores
-    num_workers = min(16, os.cpu_count())
-    
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-    
-    return train_loader, val_loader
+    try:
+        # Use the dataset directly as it's already loaded with the correct split
+        train_dataset = LibriSpeechDataset(dataset, processor, "train")
+        val_dataset = LibriSpeechDataset(dataset, processor, "validation")
+        
+        # Increase workers based on CPU cores but keep it reasonable
+        num_workers = min(8, os.cpu_count() or 1)  # More conservative worker count
+        
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=True
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=True
+        )
+        
+        return train_loader, val_loader
+    except Exception as e:
+        print(f"Error preparing dataset: {str(e)}")
+        raise e
 
 def compute_metrics(pred_texts, ref_texts):
     """Compute WER and additional metrics"""
@@ -113,6 +136,10 @@ def train_epoch(model, train_loader, optimizer, device, scaler):
         model.train()
         total_loss = 0
         progress_bar = tqdm(train_loader, desc="Training")
+        
+        # Clear cache before training
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         optimizer.zero_grad()
         for i, batch in enumerate(progress_bar):
@@ -143,14 +170,23 @@ def train_epoch(model, train_loader, optimizer, device, scaler):
                 progress_bar.set_postfix({"loss": loss.item()})
                 
                 # Log to W&B
-                wandb.log({"batch_loss": loss.item()})
+                wandb.log({
+                    "batch_loss": loss.item(),
+                    "learning_rate": optimizer.param_groups[0]['lr']
+                })
                 
-                if (i + 1) % 100 == 0:  # Log every 100 batches
+                if (i + 1) % 100 == 0:
                     log_gpu_memory()
+                    # Clear cache periodically
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
                 print(f"OOM error in batch {i}. Skipping batch...")
+                continue
+            except Exception as e:
+                print(f"Error in batch {i}: {str(e)}")
                 continue
         
         return total_loss / len(train_loader)
@@ -159,6 +195,7 @@ def train_epoch(model, train_loader, optimizer, device, scaler):
         raise e
 
 def validate(model, val_loader, device):
+    """Validation function for the model"""
     torch.cuda.empty_cache()  # Clear GPU cache before validation
     model.eval()
     total_wer = 0
@@ -167,22 +204,26 @@ def validate(model, val_loader, device):
     
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Validating"):
-            input_features = batch['input_features'].to(device)
-            labels = batch['labels'].to(device)
-            
-            # Generate predictions
-            generated_ids = model.generate(
-                input_features=input_features,
-                max_length=256,
-                num_beams=5
-            )
-            
-            # Decode predictions and references
-            transcriptions = processor.batch_decode(generated_ids, skip_special_tokens=True)
-            references = processor.batch_decode(labels, skip_special_tokens=True)
-            
-            all_predictions.extend(transcriptions)
-            all_references.extend(references)
+            try:
+                input_features = batch['input_features'].to(device)
+                labels = batch['labels'].to(device)
+                
+                # Generate predictions
+                generated_ids = model.generate(
+                    input_features=input_features,
+                    max_length=256,
+                    num_beams=5
+                )
+                
+                # Decode predictions and references
+                transcriptions = processor.batch_decode(generated_ids, skip_special_tokens=True)
+                references = processor.batch_decode(labels, skip_special_tokens=True)
+                
+                all_predictions.extend(transcriptions)
+                all_references.extend(references)
+            except Exception as e:
+                print(f"Error in validation batch: {str(e)}")
+                continue
     
     # Compute metrics
     metrics = compute_metrics(all_predictions, all_references)
@@ -298,18 +339,24 @@ def objective(trial):
         processor = WhisperProcessor.from_pretrained(model_name)
         model = WhisperForConditionalGeneration.from_pretrained(model_name).to(device)
         
-        # Set a longer timeout
-        config.HF_DATASETS_TIMEOUT = 1000  # 1000 seconds
-
-        # Try downloading with explicit cache directory
-        dataset = load_dataset(
+        # Load dataset using exactly the provided approach
+        train_dataset = load_dataset(
             "librispeech_asr",
             "clean",
-            data_dir="./data/LibriSpeech/LibriSpeech",
-            cache_dir="./data"
+            split="train.100",
+            trust_remote_code=True,
+            storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}},
         )
         
-        # Prepare datasets with trial-specific batch size
+        val_dataset = load_dataset(
+            "librispeech_asr",
+            "clean",
+            split="validation",
+            trust_remote_code=True,
+            storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}},
+        )
+        
+        dataset = {"train": train_dataset, "validation": val_dataset}
         train_loader, val_loader = prepare_dataset(dataset, processor, config["batch_size"])
         
         # Training setup
@@ -343,6 +390,19 @@ def objective(trial):
         wandb.finish()
         raise e
 
+def check_training_config():
+    """Verify training configuration"""
+    if not torch.cuda.is_available():
+        print("WARNING: CUDA is not available. Training will be slow on CPU.")
+    
+    print("\nTraining Configuration:")
+    print(f"Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    
+    return True
+
 def main():
     # Initialize wandb first
     wandb.init(
@@ -359,17 +419,32 @@ def main():
         }
     )
 
+    # Check training configuration
+    if not check_training_config():
+        raise RuntimeError("Training configuration check failed")
+
     # Setup model and training
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = WhisperForConditionalGeneration.from_pretrained(MODEL_NAME).to(device)
     
-    # Load dataset
-    dataset = load_dataset(
+    # Load dataset using exactly the provided approach
+    train_dataset = load_dataset(
         "librispeech_asr",
         "clean",
-        data_dir="./data/LibriSpeech/LibriSpeech",
-        cache_dir="./data"
+        split="train.100",
+        trust_remote_code=True,
+        storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}},
     )
+    
+    val_dataset = load_dataset(
+        "librispeech_asr",
+        "clean",
+        split="validation",
+        trust_remote_code=True,
+        storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}},
+    )
+    
+    dataset = {"train": train_dataset, "validation": val_dataset}
     train_loader, val_loader = prepare_dataset(dataset, processor, wandb.config.batch_size)
     
     # Training setup
@@ -403,4 +478,4 @@ def main():
     wandb.finish()
 
 if __name__ == "__main__":
-    main() 
+    main()
