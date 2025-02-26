@@ -7,28 +7,47 @@ from tqdm.auto import tqdm
 from torch.cuda.amp import autocast, GradScaler
 import os
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
+
+# Force numpy to load before pyannote
+np.nan  # Pre-load numpy constants
+
+# Then pyannote imports
 from pyannote.audio import Pipeline
 from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbedding
+from pyannote.audio.pipelines.speaker_diarization import SpeakerDiarization
 import aiohttp
 
 # Global configurations
 MODEL_NAME = "openai/whisper-tiny.en"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DIARIZATION_MODEL_PATH = "models/pyannote_diarization"  # Local path for cached model
 
-# W&B setup
-wandb.init(
-    project="WhisperVox",
-    name="voxconverse-initial",
-    config={
-        "dataset": "voxconverse",
-        "model_type": "tiny.en",
-        "batch_size": 24,
-        "learning_rate": 2e-5,
-        "epochs": 5,
-        "max_audio_length": 30,
-        "sampling_rate": 16000,
-    }
-)
+def cache_diarization_model():
+    """Set up diarization pipeline using latest models"""
+    try:
+        # Get token from environment or file
+        token_path = "/root/.cache/huggingface/token"
+        with open(token_path, 'r') as f:
+            hf_token = f.read().strip()
+            
+        # Use the latest pipeline version
+        pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=hf_token
+        )
+        
+        # Move to device without using global DEVICE
+        if torch.cuda.is_available():
+            pipeline = pipeline.to(torch.device('cuda'))
+        else:
+            pipeline = pipeline.to(torch.device('cpu'))
+        
+        print("Diarization pipeline initialized")
+        return pipeline
+        
+    except Exception as e:
+        print(f"Error setting up diarization: {str(e)}")
+        raise e
 
 class VoxConverseDataset(Dataset):
     """Custom Dataset for VoxConverse diarization data"""
