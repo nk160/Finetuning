@@ -26,13 +26,13 @@ wandb.init(
     config={
         "dataset": "train-clean-100",
         "model_type": "tiny.en",
-        "batch_size": 32,
+        "batch_size": 16,
         "learning_rate": 2e-5,
         "epochs": 1,
         "validation_steps": 100,
         "max_audio_length": 30,  # maximum audio length in seconds
         "sampling_rate": 16000,
-        "gradient_accumulation_steps": 2
+        "gradient_accumulation_steps": 1
     }
 )
 
@@ -50,23 +50,20 @@ class LibriSpeechDataset(Dataset):
             item = self.dataset[idx]
             audio = item['audio']['array']
             
-            # Add audio length check
             if len(audio) == 0:
                 raise ValueError("Empty audio file encountered")
                 
-            # Process audio using Whisper processor
+            # Let Whisper handle the dimensions with its default settings
             inputs = self.processor(
                 audio, 
                 sampling_rate=16000, 
-                return_tensors="pt",
-                padding=True
+                return_tensors="pt"
             )
             
-            # Get text and process it
-            labels = self.processor(
+            # Process text with Whisper's default tokenizer settings
+            labels = self.processor.tokenizer(
                 text=item['text'],
-                return_tensors="pt",
-                padding=True
+                return_tensors="pt"
             ).input_ids
             
             return {
@@ -75,18 +72,56 @@ class LibriSpeechDataset(Dataset):
             }
         except Exception as e:
             print(f"Error processing item {idx}: {str(e)}")
-            # Return a dummy item or skip
             raise e
+
+def collate_fn(batch):
+    """Custom collate function to handle variable length inputs"""
+    # Filter out failed items
+    batch = [item for item in batch if item is not None]
+    if len(batch) == 0:
+        return {}
+        
+    input_features = []
+    labels = []
+    
+    # Get max lengths
+    max_input_length = max([item['input_features'].shape[-1] for item in batch])
+    max_label_length = max([item['labels'].shape[-1] for item in batch])
+    
+    # Pad each item to max length
+    for item in batch:
+        input_pad = max_input_length - item['input_features'].shape[-1]
+        label_pad = max_label_length - item['labels'].shape[-1]
+        
+        input_features.append(torch.nn.functional.pad(
+            item['input_features'], 
+            (0, input_pad), 
+            'constant', 
+            0
+        ))
+        labels.append(torch.nn.functional.pad(
+            item['labels'], 
+            (0, label_pad), 
+            'constant', 
+            -100  # padding token
+        ))
+    
+    # Stack tensors
+    input_features = torch.stack(input_features)
+    labels = torch.stack(labels)
+    
+    return {
+        'input_features': input_features,
+        'labels': labels
+    }
 
 def prepare_dataset(dataset, processor, batch_size):
     """Load and prepare LibriSpeech dataset"""
     try:
-        # Use the dataset directly as it's already loaded with the correct split
         train_dataset = LibriSpeechDataset(dataset, processor, "train")
         val_dataset = LibriSpeechDataset(dataset, processor, "validation")
         
-        # Increase workers based on CPU cores but keep it reasonable
-        num_workers = min(8, os.cpu_count() or 1)  # More conservative worker count
+        num_workers = min(8, os.cpu_count() or 1)
         
         train_loader = DataLoader(
             train_dataset, 
@@ -95,7 +130,8 @@ def prepare_dataset(dataset, processor, batch_size):
             num_workers=num_workers,
             pin_memory=True,
             drop_last=True,
-            persistent_workers=True
+            persistent_workers=True,
+            collate_fn=collate_fn
         )
         val_loader = DataLoader(
             val_dataset,
@@ -104,7 +140,8 @@ def prepare_dataset(dataset, processor, batch_size):
             num_workers=num_workers,
             pin_memory=True,
             drop_last=True,
-            persistent_workers=True
+            persistent_workers=True,
+            collate_fn=collate_fn
         )
         
         return train_loader, val_loader
@@ -249,79 +286,41 @@ class EarlyStopping:
             self.counter = 0
 
 class ModelCheckpointer:
-    def __init__(self, wandb_run):
+    def __init__(self, run_name, output_dir="./checkpoints"):
         self.best_wer = float('inf')
-        self.wandb_run = wandb_run
-        
-    def save_checkpoint(self, model, optimizer, epoch, train_loss, val_metrics, is_best=False):
-        # Enhanced metadata for checkpoint
-        checkpoint = {
-            'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'train_loss': train_loss,
-            'val_metrics': val_metrics,
-            'model_config': {
-                'model_type': wandb.config.model_type,
-                'dataset': wandb.config.dataset,
-                'batch_size': wandb.config.batch_size,
-                'learning_rate': wandb.config.learning_rate
-            },
-            'best_wer': self.best_wer,
-            'dataset_info': {
-                'train_samples': 28539,  # from LibriSpeech clean-100 split
-                'valid_samples': 2703,
-                'test_samples': 2620
-            },
-            'timestamp': wandb.run.start_time,
-            'run_id': wandb.run.id
-        }
-        
-        # Save checkpoint locally and to W&B
-        checkpoint_path = f"checkpoint_epoch_{epoch+1}"
-        if is_best:
-            checkpoint_path += "_best"
+        self.output_dir = output_dir
+        self.run_name = run_name
+        os.makedirs(output_dir, exist_ok=True)
+    
+    def save_checkpoint(self, model, processor, wer, epoch):
+        """Save model if WER improves"""
+        if wer < self.best_wer:
+            self.best_wer = wer
+            checkpoint_dir = os.path.join(self.output_dir, f"epoch_{epoch}_wer_{wer:.4f}")
+            os.makedirs(checkpoint_dir, exist_ok=True)
             
-        torch.save(checkpoint, checkpoint_path + ".pt")
-        
-        # Create W&B artifact
-        artifact_name = checkpoint_path
-        model_artifact = wandb.Artifact(
-            name=artifact_name,
-            type="model",
-            description=f"Whisper model fine-tuned on LibriSpeech Clean 100 - Epoch {epoch+1}" + 
-                       (" (Best)" if is_best else "")
-        )
-        
-        # Add files to artifact
-        model_artifact.add_file(checkpoint_path + ".pt")
-        
-        # Log artifact to W&B
-        self.wandb_run.log_artifact(model_artifact)
-        
-    def check_and_save(self, model, optimizer, epoch, train_loss, val_metrics):
-        current_wer = val_metrics["wer"]
-        
-        # Save regular checkpoint
-        self.save_checkpoint(model, optimizer, epoch, train_loss, val_metrics)
-        
-        # Save best model if WER improved
-        if current_wer < self.best_wer:
-            self.best_wer = current_wer
-            self.save_checkpoint(model, optimizer, epoch, train_loss, val_metrics, is_best=True)
-            print(f"New best WER: {current_wer:.4f}")
+            # Save model and processor
+            model.save_pretrained(checkpoint_dir)
+            processor.save_pretrained(checkpoint_dir)
+            
+            # Log to wandb
+            wandb.log({
+                "best_wer": wer,
+                "checkpoint_saved": checkpoint_dir
+            })
+            print(f"\nSaved checkpoint with WER: {wer:.4f} to {checkpoint_dir}")
 
 def objective(trial):
     config = {
         "dataset": "train-clean-100",
         "model_type": "tiny.en",
-        "batch_size": 32,
+        "batch_size": 16,
         "learning_rate": 2e-5,
         "epochs": 1,
         "validation_steps": 100,
         "max_audio_length": 30,
         "sampling_rate": 16000,
-        "gradient_accumulation_steps": 2
+        "gradient_accumulation_steps": 1
     }
     
     # Initialize W&B for this trial
@@ -363,6 +362,7 @@ def objective(trial):
         optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
         scaler = GradScaler()
         early_stopping = EarlyStopping(patience=1, min_delta=0.001)
+        checkpointer = ModelCheckpointer(wandb.run.name)
         
         best_wer = float('inf')
         
@@ -374,9 +374,8 @@ def objective(trial):
             current_wer = val_metrics["wer"]
             trial.report(current_wer, epoch)
             
-            # Update best WER
-            if current_wer < best_wer:
-                best_wer = current_wer
+            # Save checkpoint if WER improved
+            checkpointer.save_checkpoint(model, processor, current_wer, epoch)
             
             # Early stopping check
             early_stopping(current_wer)
@@ -411,11 +410,11 @@ def main():
         config={
             "model_name": MODEL_NAME,
             "dataset": "train-clean-100",
-            "batch_size": 8,
+            "batch_size": 16,
             "learning_rate": 1e-5,
             "max_steps": 4000,
             "warmup_steps": 500,
-            "gradient_accumulation_steps": 2,
+            "gradient_accumulation_steps": 1,
         }
     )
 
@@ -450,7 +449,7 @@ def main():
     # Training setup
     optimizer = torch.optim.Adam(model.parameters(), lr=wandb.config.learning_rate)
     scaler = GradScaler()
-    checkpointer = ModelCheckpointer(wandb.run)
+    checkpointer = ModelCheckpointer(wandb.run.name)
     
     # Create Optuna study
     study = optuna.create_study(
