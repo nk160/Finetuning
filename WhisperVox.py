@@ -94,7 +94,8 @@ class VoxConverseDataset(Dataset):
                 'input_features': inputs.input_features.squeeze(),
                 'attention_mask': inputs.attention_mask.squeeze(),
                 'labels': labels.input_ids.squeeze(),
-                'speaker_embeddings': speaker_embeddings
+                'speaker_embeddings': speaker_embeddings,
+                'speaker_labels': torch.zeros(1)  # Placeholder for now
             }
             
         except Exception as e:
@@ -102,21 +103,21 @@ class VoxConverseDataset(Dataset):
             raise e 
 
 def prepare_dataset(processor, batch_size):
-    """Load and prepare VoxConverse dataset"""
+    """Load and prepare Common Voice dataset"""
     try:
-        # Load VoxConverse dataset
+        # Load Common Voice dataset with streaming
         train_dataset = load_dataset(
-            "edinburghcstr/voxconverse",
-            split="train",
-            trust_remote_code=True,
-            storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}},
+            "mozilla-foundation/common_voice_11_0",
+            "en",
+            split="train[:100]",  # Just 100 examples
+            streaming=True,  # Stream instead of downloading all
         )
         
         val_dataset = load_dataset(
-            "edinburghcstr/voxconverse",
-            split="validation",
-            trust_remote_code=True,
-            storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}},
+            "mozilla-foundation/common_voice_11_0",
+            "en",
+            split="validation[:10]",  # Just 10 examples
+            streaming=True,  # Stream instead of downloading all
         )
         
         # Create dataset instances
@@ -189,9 +190,9 @@ class DiarizationModel(torch.nn.Module):
         }
 
 class ModelCheckpointer:
-    def __init__(self, wandb_run):
+    def __init__(self, run):
         self.best_der = float('inf')
-        self.wandb_run = wandb_run
+        self.run = run
         
     def save_checkpoint(self, model, optimizer, epoch, train_loss, val_metrics, is_best=False):
         checkpoint = {
@@ -209,17 +210,17 @@ class ModelCheckpointer:
             
         torch.save(checkpoint, checkpoint_path + ".pt")
         
-        # Log to wandb
-        artifact = wandb.Artifact(
+        # Log to wandb using run object
+        artifact = self.run.Artifact(
             name=checkpoint_path,
             type="model",
             description=f"Whisper Diarization Model - Epoch {epoch+1}" + 
                        (" (Best)" if is_best else "")
         )
         artifact.add_file(checkpoint_path + ".pt")
-        self.wandb_run.log_artifact(artifact) 
+        self.run.log_artifact(artifact)
 
-def train_epoch(model, train_loader, optimizer, device, scaler):
+def train_epoch(model, train_loader, optimizer, device, scaler, diarization_weight, run):
     """Train one epoch of the diarization model"""
     model.train()
     total_loss = 0
@@ -256,7 +257,7 @@ def train_epoch(model, train_loader, optimizer, device, scaler):
                 )
                 
                 # Combined loss
-                loss = asr_loss + wandb.config.diarization_weight * diarization_loss
+                loss = asr_loss + diarization_weight * diarization_loss
             
             # Backward pass with gradient scaling
             scaler.scale(loss).backward()
@@ -273,8 +274,8 @@ def train_epoch(model, train_loader, optimizer, device, scaler):
                 'diar_loss': diarization_loss.item()
             })
             
-            # Log to wandb
-            wandb.log({
+            # Log to wandb using run
+            run.log({
                 'batch_loss': loss.item(),
                 'asr_loss': asr_loss.item(),
                 'diarization_loss': diarization_loss.item()
@@ -286,7 +287,7 @@ def train_epoch(model, train_loader, optimizer, device, scaler):
     
     return total_loss / len(train_loader)
 
-def validate(model, val_loader, device):
+def validate(model, val_loader, device, processor):
     """Validate the diarization model"""
     model.eval()
     total_der = 0
@@ -367,16 +368,8 @@ class EarlyStopping:
             self.best_loss = val_loss
             self.counter = 0 
 
-def setup_training():
+def setup_training(config):  # Accept config as parameter
     """Initialize model, optimizer, and other training components"""
-    # Update wandb config with diarization specific parameters
-    wandb.config.update({
-        "diarization_weight": 0.3,
-        "num_speakers": 2,
-        "patience": 1,
-        "warmup_steps": 500
-    })
-    
     # Initialize Whisper model and processor
     processor = WhisperProcessor.from_pretrained(MODEL_NAME)
     whisper_model = WhisperForConditionalGeneration.from_pretrained(MODEL_NAME)
@@ -384,13 +377,13 @@ def setup_training():
     # Create combined model
     model = DiarizationModel(
         whisper_model=whisper_model,
-        num_speakers=wandb.config.num_speakers
+        num_speakers=config["num_speakers"]  # Use passed config
     ).to(DEVICE)
     
     # Setup optimizer with weight decay
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=wandb.config.learning_rate,
+        lr=config["learning_rate"],  # Use passed config
         weight_decay=0.01
     )
     
@@ -398,47 +391,69 @@ def setup_training():
 
 def main():
     """Main training routine"""
+    # Initialize wandb first with all configs
+    run = wandb.init(
+        project="WhisperVox",
+        name="voxconverse-initial",
+        config={
+            "dataset": "voxconverse",
+            "model_type": "tiny.en",
+            "batch_size": 24,
+            "learning_rate": 2e-5,
+            "epochs": 5,
+            "max_audio_length": 30,
+            "sampling_rate": 16000,
+            "diarization_weight": 0.3,
+            "num_speakers": 2,
+            "patience": 1,
+            "warmup_steps": 500
+        }
+    )
+    
     print("Initializing training...")
     print(f"Device: {DEVICE}")
     print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
     
-    # Setup model and training components
-    model, processor, optimizer = setup_training()
+    # Pass config to setup_training
+    model, processor, optimizer = setup_training(run.config)
     
     # Prepare datasets
-    train_loader, val_loader = prepare_dataset(processor, wandb.config.batch_size)
+    train_loader, val_loader = prepare_dataset(processor, run.config.batch_size)
     
     # Initialize training utilities
     scaler = GradScaler()
     early_stopping = EarlyStopping(
-        patience=wandb.config.patience,
+        patience=run.config.patience,
         min_delta=0.001
     )
-    checkpointer = ModelCheckpointer(wandb.run)
+    checkpointer = ModelCheckpointer(run)
     
     # Training loop
     print("Starting training...")
-    for epoch in range(wandb.config.epochs):
-        print(f"\nEpoch {epoch+1}/{wandb.config.epochs}")
+    for epoch in range(run.config.epochs):
+        print(f"\nEpoch {epoch+1}/{run.config.epochs}")
         
-        # Training phase
+        # Training phase with added parameters
         train_loss = train_epoch(
             model=model,
             train_loader=train_loader,
             optimizer=optimizer,
             device=DEVICE,
-            scaler=scaler
+            scaler=scaler,
+            diarization_weight=run.config.diarization_weight,
+            run=run  # Pass run object
         )
         
-        # Validation phase
+        # Validation phase with processor
         val_metrics = validate(
             model=model,
             val_loader=val_loader,
-            device=DEVICE
+            device=DEVICE,
+            processor=processor  # Pass processor
         )
         
         # Log metrics
-        wandb.log({
+        run.log({
             'epoch': epoch + 1,
             'train_loss': train_loss,
             'val_der': val_metrics['der'],
@@ -466,12 +481,14 @@ def main():
             break
     
     print("Training completed!")
-    wandb.finish()
+    run.finish()
 
 if __name__ == "__main__":
+    run = None
     try:
         main()
     except Exception as e:
         print(f"Error in main: {str(e)}")
-        wandb.finish()
+        if run is not None:
+            run.finish()
         raise e 
