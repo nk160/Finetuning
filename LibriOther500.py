@@ -12,6 +12,7 @@ import json
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
 import evaluate
+import aiohttp
 
 # Global model configuration
 MODEL_NAME = "openai/whisper-tiny.en"
@@ -287,8 +288,21 @@ def objective(trial):
         model = WhisperForConditionalGeneration.from_pretrained(model_name).to(device)
         
         # Load dataset
-        dataset = load_dataset("librispeech_asr", "other")  # Changed to "other" subset
-        train_loader, val_loader = prepare_dataset(dataset, processor, config["batch_size"])
+        train_dataset = load_dataset(
+            "librispeech_asr",
+            "other",
+            split="train.500",
+            trust_remote_code=True,
+            storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}},
+        )
+        val_dataset = load_dataset(
+            "librispeech_asr",
+            "other",
+            split="validation",
+            trust_remote_code=True,
+            storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}},
+        )
+        train_loader, val_loader = prepare_dataset(train_dataset, processor, config["batch_size"])
         
         # Training setup
         optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
@@ -339,8 +353,21 @@ def main():
     model = WhisperForConditionalGeneration.from_pretrained(MODEL_NAME).to(device)
     
     # Load dataset
-    dataset = load_dataset("librispeech_asr", "other")
-    train_loader, val_loader = prepare_dataset(dataset, processor, wandb.config.batch_size)
+    train_dataset = load_dataset(
+        "librispeech_asr",
+        "other",
+        split="train.500",
+        trust_remote_code=True,
+        storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}},
+    )
+    val_dataset = load_dataset(
+        "librispeech_asr",
+        "other",
+        split="validation",
+        trust_remote_code=True,
+        storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}},
+    )
+    train_loader, val_loader = prepare_dataset(train_dataset, processor, wandb.config.batch_size)
     
     # Training setup
     optimizer = torch.optim.Adam(model.parameters(), lr=wandb.config.learning_rate)
