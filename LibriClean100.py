@@ -53,22 +53,26 @@ class LibriSpeechDataset(Dataset):
             if len(audio) == 0:
                 raise ValueError("Empty audio file encountered")
                 
-            # Let Whisper handle the dimensions with its default settings
+            # Process inputs with attention mask
             inputs = self.processor(
                 audio, 
                 sampling_rate=16000, 
-                return_tensors="pt"
+                return_tensors="pt",
+                return_attention_mask=True
             )
             
-            # Process text with Whisper's default tokenizer settings
+            # Process text
             labels = self.processor.tokenizer(
                 text=item['text'],
-                return_tensors="pt"
-            ).input_ids
+                return_tensors="pt",
+                padding="max_length",
+                return_attention_mask=True
+            )
             
             return {
                 'input_features': inputs.input_features.squeeze(),
-                'labels': labels.squeeze()
+                'attention_mask': inputs.attention_mask.squeeze(),
+                'labels': labels.input_ids.squeeze()
             }
         except Exception as e:
             print(f"Error processing item {idx}: {str(e)}")
