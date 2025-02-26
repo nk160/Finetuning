@@ -22,13 +22,13 @@ processor = WhisperProcessor.from_pretrained(MODEL_NAME)
 # W&B setup
 wandb.init(
     project="whisper-fine-tuning",
-    name="librispeech-clean-100-test",
+    name="librispeech-clean-100-5epochs",
     config={
         "dataset": "train-clean-100",
         "model_type": "tiny.en",
         "batch_size": 16,
         "learning_rate": 2e-5,
-        "epochs": 1,
+        "epochs": 5,
         "validation_steps": 100,
         "max_audio_length": 30,  # maximum audio length in seconds
         "sampling_rate": 16000,
@@ -61,11 +61,13 @@ class LibriSpeechDataset(Dataset):
                 return_attention_mask=True
             )
             
-            # Process text
+            # Process text with max length constraint
             labels = self.processor.tokenizer(
                 text=item['text'],
                 return_tensors="pt",
                 padding="max_length",
+                max_length=448,
+                truncation=True,
                 return_attention_mask=True
             )
             
@@ -248,10 +250,12 @@ def validate(model, val_loader, device):
             try:
                 input_features = batch['input_features'].to(device)
                 labels = batch['labels'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
                 
-                # Generate predictions
+                # Generate predictions with attention mask
                 generated_ids = model.generate(
                     input_features=input_features,
+                    attention_mask=attention_mask,
                     max_length=256,
                     num_beams=5
                 )
@@ -320,7 +324,7 @@ def objective(trial):
         "model_type": "tiny.en",
         "batch_size": 16,
         "learning_rate": 2e-5,
-        "epochs": 1,
+        "epochs": 5,
         "validation_steps": 100,
         "max_audio_length": 30,
         "sampling_rate": 16000,
@@ -410,7 +414,7 @@ def main():
     # Initialize wandb first
     wandb.init(
         project="whisper-fine-tuning",
-        name="librispeech-clean-100",
+        name="librispeech-clean-100-5epochs",
         config={
             "model_name": MODEL_NAME,
             "dataset": "train-clean-100",
