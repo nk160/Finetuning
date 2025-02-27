@@ -7,6 +7,10 @@ from tqdm.auto import tqdm
 from torch.cuda.amp import autocast, GradScaler
 import os
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
+from pathlib import Path
+import gc
+import psutil
+import torch.cuda.amp as amp
 
 # Force numpy to load before pyannote
 np.nan  # Pre-load numpy constants
@@ -20,15 +24,23 @@ import aiohttp
 # Global configurations
 MODEL_NAME = "openai/whisper-tiny.en"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-DIARIZATION_MODEL_PATH = "models/pyannote_diarization"  # Local path for cached model
+HF_TOKEN_PATH = os.path.expanduser("~/.cache/huggingface/token")
+DIARIZATION_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models/pyannote_diarization")
 
 def cache_diarization_model():
     """Set up diarization pipeline using latest models"""
     try:
+        # Create token directory if it doesn't exist
+        os.makedirs(os.path.dirname(HF_TOKEN_PATH), exist_ok=True)
+        
         # Get token from environment or file
-        token_path = "/root/.cache/huggingface/token"
-        with open(token_path, 'r') as f:
-            hf_token = f.read().strip()
+        hf_token = os.getenv("HF_TOKEN")  # First try environment variable
+        if not hf_token:
+            try:
+                with open(HF_TOKEN_PATH, 'r') as f:
+                    hf_token = f.read().strip()
+            except FileNotFoundError:
+                raise ValueError("HuggingFace token not found. Please set HF_TOKEN environment variable or create token file")
             
         # Use the latest pipeline version
         pipeline = Pipeline.from_pretrained(
@@ -103,46 +115,138 @@ class VoxConverseDataset(Dataset):
             raise e 
 
 def prepare_dataset(processor, batch_size):
-    """Load and prepare Common Voice dataset"""
+    """Load and prepare VoxConverse dataset with memory-efficient streaming"""
     try:
-        # Load Common Voice dataset with streaming
-        train_dataset = load_dataset(
-            "mozilla-foundation/common_voice_11_0",
-            "en",
-            split="train[:100]",  # Just 100 examples
-            streaming=True,  # Stream instead of downloading all
+        # Define base paths - adjust these to your actual paths
+        voxconverse_path = Path("voxconverse")
+        audio_path = voxconverse_path / "audio"
+        rttm_path = voxconverse_path / "dev"  # or "test" for test set
+        
+        def load_voxconverse_file(audio_file):
+            """Load single audio file and its corresponding RTTM"""
+            try:
+                # Load audio with torchaudio's streaming loader
+                import torchaudio
+                waveform, sample_rate = torchaudio.load(
+                    audio_file,
+                    channels_first=True,
+                    format="wav",
+                    normalize=True
+                )
+                
+                # Get corresponding RTTM file
+                rttm_file = rttm_path / f"{audio_file.stem}.rttm"
+                speaker_segments = parse_rttm(rttm_file)
+                
+                return {
+                    'audio': waveform,
+                    'sample_rate': sample_rate,
+                    'speaker_segments': speaker_segments
+                }
+            except Exception as e:
+                print(f"Error loading file {audio_file}: {str(e)}")
+                return None
+        
+        def parse_rttm(rttm_file):
+            """Parse RTTM file to get speaker segments"""
+            segments = []
+            with open(rttm_file, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 8:
+                        start_time = float(parts[3])
+                        duration = float(parts[4])
+                        speaker_id = parts[7]
+                        segments.append({
+                            'start': start_time,
+                            'duration': duration,
+                            'speaker': speaker_id
+                        })
+            return segments
+        
+        class VoxConverseStreamingDataset(Dataset):
+            def __init__(self, audio_path, processor, max_duration=30):
+                self.audio_files = list(audio_path.glob("*.wav"))
+                self.processor = processor
+                self.max_duration = max_duration
+                self.embedding_model = PretrainedSpeakerEmbedding(
+                    "speechbrain/spkrec-ecapa-voxceleb",
+                    use_auth_token=os.getenv("HF_TOKEN")
+                )
+            
+            def __len__(self):
+                return len(self.audio_files)
+            
+            def __getitem__(self, idx):
+                try:
+                    data = load_voxconverse_file(self.audio_files[idx])
+                    if data is None:
+                        raise ValueError(f"Could not load file {self.audio_files[idx]}")
+                    
+                    # Process audio in chunks if needed
+                    audio = data['audio']
+                    if audio.shape[1] > self.max_duration * data['sample_rate']:
+                        # Take first max_duration seconds
+                        audio = audio[:, :self.max_duration * data['sample_rate']]
+                    
+                    # Process audio using Whisper processor
+                    inputs = self.processor(
+                        audio.squeeze().numpy(),
+                        sampling_rate=data['sample_rate'],
+                        return_tensors="pt",
+                        return_attention_mask=True
+                    )
+                    
+                    # Get speaker embeddings for the chunk
+                    speaker_embeddings = self.embedding_model(audio.squeeze().numpy())
+                    
+                    return {
+                        'input_features': inputs.input_features.squeeze(),
+                        'attention_mask': inputs.attention_mask.squeeze(),
+                        'speaker_embeddings': speaker_embeddings,
+                        'speaker_segments': data['speaker_segments']
+                    }
+                    
+                except Exception as e:
+                    print(f"Error processing item {idx}: {str(e)}")
+                    raise e
+        
+        # Create dataset instances with streaming
+        train_dataset = VoxConverseStreamingDataset(
+            audio_path / "dev",
+            processor,
+            max_duration=30
         )
         
-        val_dataset = load_dataset(
-            "mozilla-foundation/common_voice_11_0",
-            "en",
-            split="validation[:10]",  # Just 10 examples
-            streaming=True,  # Stream instead of downloading all
+        val_dataset = VoxConverseStreamingDataset(
+            audio_path / "test",
+            processor,
+            max_duration=30
         )
         
-        # Create dataset instances
-        train_data = VoxConverseDataset(train_dataset, processor, "train")
-        val_data = VoxConverseDataset(val_dataset, processor, "validation")
-        
-        # Create data loaders
+        # Create data loaders with proper memory management
         train_loader = DataLoader(
-            train_data,
+            train_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=min(8, os.cpu_count()),
-            pin_memory=True
+            num_workers=2,  # Reduced number of workers
+            pin_memory=True,
+            prefetch_factor=2,  # Reduce prefetching
+            persistent_workers=True
         )
         
         val_loader = DataLoader(
-            val_data,
+            val_dataset,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=min(8, os.cpu_count()),
-            pin_memory=True
+            num_workers=2,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True
         )
         
         return train_loader, val_loader
-    
+        
     except Exception as e:
         print(f"Error loading dataset: {str(e)}")
         raise e
@@ -226,12 +330,15 @@ def train_epoch(model, train_loader, optimizer, device, scaler, diarization_weig
     total_loss = 0
     progress_bar = tqdm(train_loader, desc="Training")
     
-    for batch in progress_bar:
+    for batch_idx, batch in enumerate(progress_bar):
         try:
+            # Log memory usage periodically
+            if batch_idx % 10 == 0:
+                log_memory_usage()
+            
             # Move batch to device
             input_features = batch['input_features'].to(device)
             attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
             speaker_embeddings = batch['speaker_embeddings'].to(device)
             
             # Forward pass with mixed precision
@@ -246,7 +353,7 @@ def train_epoch(model, train_loader, optimizer, device, scaler, diarization_weig
                 asr_outputs = model.whisper(
                     input_features=input_features,
                     attention_mask=attention_mask,
-                    labels=labels
+                    labels=batch['labels']
                 )
                 asr_loss = asr_outputs.loss
                 
@@ -281,15 +388,27 @@ def train_epoch(model, train_loader, optimizer, device, scaler, diarization_weig
                 'diarization_loss': diarization_loss.item()
             })
             
-        except Exception as e:
-            print(f"Error in training batch: {str(e)}")
-            continue
+            # Clear memory periodically
+            if batch_idx % 50 == 0:
+                clear_memory()
+                
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print("WARNING: out of memory")
+                if hasattr(torch.cuda, 'empty_cache'):
+                    torch.cuda.empty_cache()
+                # Skip this batch
+                continue
+            else:
+                raise e
     
     return total_loss / len(train_loader)
 
 def validate(model, val_loader, device, processor):
     """Validate the diarization model"""
     model.eval()
+    log_memory_usage()  # Log initial memory state
+    
     total_der = 0
     all_predictions = []
     all_references = []
@@ -341,6 +460,7 @@ def validate(model, val_loader, device, processor):
         'wer': compute_wer(all_predictions, all_references)
     }
     
+    clear_memory()  # Clear memory after validation
     return metrics
 
 def compute_wer(predictions, references):
@@ -389,6 +509,23 @@ def setup_training(config):  # Accept config as parameter
     
     return model, processor, optimizer
 
+def log_memory_usage():
+    """Log current memory usage"""
+    if torch.cuda.is_available():
+        gpu_memory = torch.cuda.memory_allocated() / 1024**2
+        gpu_memory_max = torch.cuda.max_memory_allocated() / 1024**2
+        print(f"GPU Memory: {gpu_memory:.2f}MB (Max: {gpu_memory_max:.2f}MB)")
+    
+    process = psutil.Process()
+    ram_usage = process.memory_info().rss / 1024**2
+    print(f"RAM Usage: {ram_usage:.2f}MB")
+
+def clear_memory():
+    """Clear unused memory"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 def main():
     """Main training routine"""
     # Initialize wandb first with all configs
@@ -398,7 +535,7 @@ def main():
         config={
             "dataset": "voxconverse",
             "model_type": "tiny.en",
-            "batch_size": 24,
+            "batch_size": 32,  # Increased from 24 given 20GB VRAM
             "learning_rate": 2e-5,
             "epochs": 5,
             "max_audio_length": 30,
@@ -406,7 +543,8 @@ def main():
             "diarization_weight": 0.3,
             "num_speakers": 2,
             "patience": 1,
-            "warmup_steps": 500
+            "warmup_steps": 500,
+            "gradient_accumulation_steps": 2  # Add gradient accumulation
         }
     )
     

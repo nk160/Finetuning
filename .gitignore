@@ -1,7 +1,33 @@
+# Virtual Environments
 env/
+venv/
+
+# Python cache files
 __pycache__/
 *.pyc
+*.py[cod]
+*$py.class
+
+# OS files
 .DS_Store
+
+# Weights & Biases
 wandb/
-*.pt data/
+
+# Data and models
+*.pt
+data/
 checkpoints/
+voxconverse/
+
+# Cache and temp files
+.cache/
+*.log
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Environment variables
+.env
