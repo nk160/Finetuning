@@ -17,6 +17,7 @@ import zipfile
 import torchaudio
 import soundfile as sf
 from model_checkpointer import ModelCheckpointer
+from torch.nn.utils import clip_grad_norm_
 
 # Force numpy to load before pyannote
 np.nan  # Pre-load numpy constants
@@ -331,36 +332,41 @@ class DiarizationModel(torch.nn.Module):
         self.whisper = whisper_model
         hidden_size = self.whisper.config.d_model
         
-        # Add temporal context with Conv1d layers
-        self.temporal_context = torch.nn.Sequential(
-            torch.nn.Conv1d(hidden_size, hidden_size, kernel_size=5, padding=2, 
-                          padding_mode='replicate'),  # Use replicate padding
-            torch.nn.LayerNorm(hidden_size),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(0.4)  # Increase dropout
+        # Temporal context with residual connection
+        self.temporal_context = ResidualConvBlock(hidden_size)
+        
+        # Multi-head self attention
+        self.self_attention = torch.nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=8,
+            dropout=0.1,
+            batch_first=True
         )
         
-        # Add regularization to LSTM
+        # LSTM with skip connection
         self.sequence_layer = torch.nn.LSTM(
             input_size=hidden_size,
             hidden_size=hidden_size // 2,
             num_layers=2,
             bidirectional=True,
-            dropout=0.3,  # Increase dropout
+            dropout=0.3,
             batch_first=True
         )
         
-        # Add batch norm to help with training
-        self.final_norm = torch.nn.BatchNorm1d(num_speakers)
-        
-        # Speaker classifier
+        # Final classification with deeper network
         self.speaker_classifier = torch.nn.Sequential(
             torch.nn.Linear(hidden_size, hidden_size),
             torch.nn.LayerNorm(hidden_size),
-            torch.nn.Dropout(0.3),
             torch.nn.ReLU(),
-            torch.nn.Linear(hidden_size, num_speakers)
+            torch.nn.Dropout(0.3),
+            torch.nn.Linear(hidden_size, hidden_size // 2),
+            torch.nn.LayerNorm(hidden_size // 2),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.2),
+            torch.nn.Linear(hidden_size // 2, num_speakers)
         )
+        
+        self.final_norm = torch.nn.BatchNorm1d(num_speakers)
         
         # Initialize weights properly
         for m in self.speaker_classifier.modules():
@@ -370,48 +376,77 @@ class DiarizationModel(torch.nn.Module):
                     torch.nn.init.zeros_(m.bias)
         
     def forward(self, input_features, attention_mask, speaker_embeddings=None):
-        # Debug dimensions
-        print("\nDebug Model Forward:")
-        print(f"Input features shape: {input_features.shape}")
-        
-        # Get Whisper encoder outputs
+        # Get Whisper encodings
         encoder_outputs = self.whisper.model.encoder(
             input_features,
             attention_mask=attention_mask,
             return_dict=True
         )
-        hidden_states = encoder_outputs.last_hidden_state  # [batch, time, hidden]
-        print(f"Encoder output shape: {hidden_states.shape}")
+        hidden_states = encoder_outputs.last_hidden_state
         
-        # Apply temporal convolution
-        conv_input = hidden_states.transpose(1, 2)  # [batch, hidden, time]
+        # Apply temporal convolutions with residual
+        conv_input = hidden_states.transpose(1, 2)
         temporal_features = self.temporal_context(conv_input)
-        temporal_features = temporal_features.transpose(1, 2)  # [batch, time, hidden]
+        temporal_features = temporal_features.transpose(1, 2)
         
-        # Apply bidirectional LSTM
+        # Ensure attention mask is boolean and properly sized
+        key_padding_mask = (~attention_mask[:, ::2].to(torch.bool))  # Invert and convert to bool
+        
+        # Apply self-attention
+        attn_output, _ = self.self_attention(
+            temporal_features, 
+            temporal_features, 
+            temporal_features,
+            key_padding_mask=key_padding_mask
+        )
+        
+        # Residual connection
+        temporal_features = temporal_features + attn_output
+        
+        # Apply LSTM
         sequence_features, _ = self.sequence_layer(temporal_features)
         
-        # Speaker classification
+        # Final classification
         speaker_logits = self.speaker_classifier(sequence_features)
-        print(f"Speaker logits shape: {speaker_logits.shape}\n")
-        
-        # Add batch norm at the end
-        speaker_logits = speaker_logits.transpose(1, 2)  # [batch, speakers, time]
+        speaker_logits = speaker_logits.transpose(1, 2)
         speaker_logits = self.final_norm(speaker_logits)
-        speaker_logits = speaker_logits.transpose(1, 2)  # [batch, time, speakers]
+        speaker_logits = speaker_logits.transpose(1, 2)
         
         return {
             'encoder_outputs': encoder_outputs,
-            'speaker_logits': speaker_logits
+            'speaker_logits': speaker_logits,
+            'attention_weights': attn_output
         }
 
-def train_epoch(model, train_loader, optimizer, device, scaler, diarization_weight, run):
+class ResidualConvBlock(torch.nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = torch.nn.Conv1d(channels, channels, 3, padding=1)
+        self.conv2 = torch.nn.Conv1d(channels, channels, 3, padding=1)
+        self.norm1 = torch.nn.GroupNorm(8, channels)
+        self.norm2 = torch.nn.GroupNorm(8, channels)
+        self.dropout = torch.nn.Dropout(0.2)
+    
+    def forward(self, x):
+        residual = x
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = torch.nn.functional.gelu(x)
+        x = self.dropout(x)
+        x = self.conv2(x)
+        x = self.norm2(x)
+        x = torch.nn.functional.gelu(x)
+        x = self.dropout(x)
+        return x + residual
+
+def train_epoch(model, train_loader, optimizer, scheduler, device, scaler, run):
     """Train one epoch of the diarization model"""
     model.train()
     total_loss = 0
     progress_bar = tqdm(train_loader, desc="Training")
     
-    accumulation_steps = 4  # Accumulate over 4 steps
+    accumulation_steps = 4
+    max_grad_norm = 1.0  # Add gradient clipping threshold
     
     for batch_idx, batch in enumerate(progress_bar):
         try:
@@ -436,20 +471,30 @@ def train_epoch(model, train_loader, optimizer, device, scaler, diarization_weig
                 pt = torch.where(speaker_labels == 1, probs, 1 - probs)
                 focal_weight = (1 - pt) ** 2
                 
-                # Add sparsity regularization
-                sparsity_loss = 0.1 * probs.mean()  # Penalize high activations
+                # Compute loss components
+                bce_loss = (bce * focal_weight).mean()
+                sparsity_loss = 0.3 * probs.mean()
+                l2_loss = 0.01 * sum(p.pow(2.0).sum() for p in model.parameters())
                 
-                # Combine losses
-                loss = (bce * focal_weight).mean() + sparsity_loss
+                # Combined loss
+                loss = bce_loss + sparsity_loss + l2_loss
             
-            # Backward pass with gradient scaling
+            # Scale loss and backward
             scaler.scale(loss).backward()
             
-            # Only step optimizer after accumulation
+            # Gradient clipping
             if (batch_idx + 1) % accumulation_steps == 0:
+                scaler.unscale_(optimizer)
+                grad_norm = clip_grad_norm_(model.parameters(), max_grad_norm)
+                
+                # Log gradient norm
+                if batch_idx == 0:
+                    run.log({'gradient_norm': grad_norm})
+                
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+                scheduler.step()
             
             total_loss += loss.item()
             
@@ -472,10 +517,10 @@ def train_epoch(model, train_loader, optimizer, device, scaler, diarization_weig
                 print(f"Logits mean: {outputs['speaker_logits'].mean().item()}")
                 print(f"Labels mean: {speaker_labels.float().mean().item()}\n")
             
-            # Clear memory periodically
-            if batch_idx % 50 == 0:
+            # Clear memory more frequently
+            if batch_idx % 10 == 0:
                 clear_memory()
-                
+            
             # Debug predictions
             speaker_preds = outputs['speaker_logits'].sigmoid() > 0.5
             if batch_idx == 0:  # First batch
@@ -485,11 +530,20 @@ def train_epoch(model, train_loader, optimizer, device, scaler, diarization_weig
                 print(f"Number of true speakers: {speaker_labels.sum().item()}")
                 print(f"Sample predictions:\n{speaker_preds[0, :10, :5]}\n")  # First sequence, first 10 frames, first 5 speakers
             
+            # Log detailed metrics
+            if batch_idx == 0:
+                run.log({
+                    'bce_loss': bce_loss.item(),
+                    'sparsity_loss': sparsity_loss.item(),
+                    'l2_loss': l2_loss.item(),
+                    'total_loss': loss.item(),
+                    'learning_rate': scheduler.get_last_lr()[0]
+                })
+            
         except RuntimeError as e:
             if "out of memory" in str(e):
                 print("WARNING: out of memory")
-                if hasattr(torch.cuda, 'empty_cache'):
-                    torch.cuda.empty_cache()
+                clear_memory()
                 continue
             else:
                 raise e
@@ -599,14 +653,12 @@ def setup_training(config):
         
         num_speakers = len(unique_speakers)
         print(f"Found {num_speakers} unique speakers in dataset")
-        
-        # Update wandb config properly
         wandb.config.update({"num_speakers": num_speakers}, allow_val_change=True)
     
-    # Create combined model with same number of speakers
+    # Create combined model
     model = DiarizationModel(
         whisper_model=whisper_model,
-        num_speakers=wandb.config.num_speakers  # Use config value
+        num_speakers=wandb.config.num_speakers
     ).to(DEVICE)
     
     # Setup optimizer with weight decay
@@ -690,19 +742,36 @@ def main():
             "num_speakers": None,  # Will be set from dataset
             "patience": 1,
             "debug": True,
-            "diarization_weight": 1.0
+            "diarization_weight": 1.0,
+            "max_grad_norm": 1.0,
+            "warmup_steps": 100,
+            "val_every_n_steps": 500,
+            "gradient_accumulation_steps": 4
         }
     )
     
     print("Initializing training...")
     print(f"Device: {DEVICE}")
     
-    # Setup with debug mode
+    # Get model components
     model, processor, optimizer = setup_training(run.config)
+    
+    # Prepare data
     train_loader, val_loader = prepare_dataset(
         processor, 
         run.config.batch_size,
         debug=run.config.debug
+    )
+    
+    # Create scheduler after we have train_loader
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=run.config.learning_rate,
+        epochs=run.config.epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.1,
+        div_factor=25,
+        final_div_factor=1000
     )
     
     # Initialize training utilities
@@ -723,9 +792,9 @@ def main():
             model=model,
             train_loader=train_loader,
             optimizer=optimizer,
+            scheduler=scheduler,
             device=DEVICE,
             scaler=scaler,
-            diarization_weight=run.config.diarization_weight,
             run=run  # Pass run object
         )
         
