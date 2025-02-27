@@ -31,3 +31,4 @@ build/
 
 # Environment variables
 .env
+best_whisper_diarization/
