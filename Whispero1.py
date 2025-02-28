@@ -116,6 +116,8 @@ def train_one_epoch(model, loader, optimizer, scheduler, device, scaler, run):
     model.train()
     total_loss = 0
     optimizer.zero_grad()
+    torch.cuda.empty_cache()
+    torch.cuda.set_per_process_memory_fraction(0.75)  # Limit GPU memory usage
     for i, batch in enumerate(tqdm(loader, desc="Train")):
         feats = batch["input_features"].to(device)
         mask = batch["attention_mask"].to(device)
@@ -123,15 +125,20 @@ def train_one_epoch(model, loader, optimizer, scheduler, device, scaler, run):
         with torch.amp.autocast(device_type='cuda'):
             logits = model(feats, mask)
             probs = logits.sigmoid()
-            pt = torch.where(labels == 1, probs, 1 - probs)
+            labels_cpu = labels.cpu()
+            probs_cpu = probs.cpu()
+            pt = torch.where(labels_cpu == 1, probs_cpu, 1 - probs_cpu)
             focal_weight = (1 - pt) ** 2
             loss_bce = torch.nn.functional.binary_cross_entropy_with_logits(
                 logits, 
                 labels, 
                 reduction='none',
-                pos_weight=torch.ones(run.config.num_speakers, device=device) * 5.0
+                pos_weight=torch.ones(run.config.num_speakers, device=device) * 2.0
             )
             loss = (loss_bce * focal_weight).mean()
+            l1_lambda = 0.01
+            l1_reg = sum(p.abs().sum() for p in model.classifier.parameters())
+            loss = loss + l1_lambda * l1_reg
         scaler.scale(loss / ACCUMULATION_STEPS).backward()
         total_loss += loss.item()
         run.log({"batch_loss": loss.item()})
@@ -142,6 +149,8 @@ def train_one_epoch(model, loader, optimizer, scheduler, device, scaler, run):
             scaler.update()
             optimizer.zero_grad()
             scheduler.step()
+        if i % 5 == 0:  # Clear cache more frequently
+            torch.cuda.empty_cache()
         clear_mem()
     return total_loss / len(loader)
 
@@ -176,11 +185,15 @@ def validate(model, loader, device):
 def main():
     run = wandb.init(project="WhisperVox", config={
         "epochs": 15,
-        "batch_size": 128,  # Double batch size
+        "batch_size": 64,  # Further reduce batch size
         "lr": 3e-5,
+        "warmup_steps": 100,
         "num_speakers": None
     })
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Define gradient accumulation steps
+    global ACCUMULATION_STEPS
+    ACCUMULATION_STEPS = 2  # Effective batch size = 256 * 2 = 512
 
     processor = WhisperProcessor.from_pretrained("openai/whisper-tiny.en")
     whisper_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny.en")
@@ -203,21 +216,28 @@ def main():
 
     train_data = VoxSimpleDataset(train_subset, processor, run.config.num_speakers)
     val_data = VoxSimpleDataset(val_subset, processor, run.config.num_speakers)
-    train_loader = DataLoader(train_data, batch_size=run.config.batch_size, shuffle=True)
+    train_loader = DataLoader(
+        train_data, 
+        batch_size=run.config.batch_size, 
+        shuffle=True,
+        num_workers=2,
+        prefetch_factor=2,
+        pin_memory=False  # Reduce memory pressure
+    )
     val_loader = DataLoader(val_data, batch_size=run.config.batch_size, shuffle=False)
 
     model = DiarizationModel(whisper_model, run.config.num_speakers).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=run.config.lr)
     scheduler = OneCycleLR(
         optimizer,
-        max_lr=run.config.lr,
+        max_lr=run.config.lr * 2,  # Double peak learning rate
         epochs=run.config.epochs,
-        steps_per_epoch=len(train_loader)
+        steps_per_epoch=len(train_loader),
+        pct_start=0.1,  # Warmup for 10% of training
+        div_factor=25.0,  # Initial lr = max_lr/25
+        final_div_factor=1000.0  # Final lr = max_lr/1000
     )
     scaler = torch.amp.GradScaler()
-
-    # And add gradient accumulation
-    ACCUMULATION_STEPS = 2  # Effective batch size = 128 * 2 = 256
 
     for epoch in range(run.config.epochs):
         train_loss = train_one_epoch(model, train_loader, optimizer, scheduler, device, scaler, run)
