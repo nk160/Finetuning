@@ -73,7 +73,7 @@ class DiarizationModel(torch.nn.Module):
         # Simple convolutional layer for temporal context
         self.conv = torch.nn.Sequential(
             torch.nn.Conv1d(hidden, hidden, 3, padding=1),
-            torch.nn.GroupNorm(8, hidden),
+            torch.nn.BatchNorm1d(hidden),
             torch.nn.GELU(),
             torch.nn.Dropout(0.3)
         )
@@ -126,7 +126,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, device, scaler, run):
             logits = model(feats, mask)
             
             # Balanced class weighting (1:2 instead of 1:10)
-            pos_weight = torch.ones(run.config.num_speakers, device=device) * 1.5
+            pos_weight = torch.ones(run.config.num_speakers, device=device) * 3.0
             
             # Use standard BCE loss with pos_weight parameter
             loss = torch.nn.functional.binary_cross_entropy_with_logits(
@@ -183,7 +183,7 @@ def validate(model, loader, device):
             logits = model(feats, mask)
             
             # Try multiple thresholds
-            thresholds = [0.3, 0.4, 0.5, 0.6, 0.7]  # Added lower thresholds
+            thresholds = [0.2, 0.3, 0.4, 0.5, 0.6]
             best_der = float('inf')
             best_preds = None
             best_thresh = None
@@ -266,10 +266,11 @@ def filter_predictions(preds, min_duration=3, max_gaps=2):
 
 def main():
     run = wandb.init(project="WhisperVox", config={
-        "epochs": 1,  # Test run with single epoch
-        "batch_size": 16,  # Medium batch size
-        "lr": 1e-5,  # Conservative learning rate
-        "num_speakers": None
+        "epochs": 1,   # Initial test run
+        "batch_size": 4,  # Small batch size for more gradient updates
+        "lr": 2e-5,  # Slightly higher learning rate
+        "num_speakers": None,
+        "early_stopping_patience": 5
     })
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -339,7 +340,7 @@ def main():
 
     # Training loop
     best_der = float('inf')
-    patience = 3
+    patience = run.config.early_stopping_patience
     no_improve_count = 0
     
     for epoch in range(run.config.epochs):
