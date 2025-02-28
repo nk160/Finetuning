@@ -428,9 +428,9 @@ def filter_predictions(preds, min_duration=2, max_gap=3):
 def main():
     # Start wandb run
     run = wandb.init(project="WhisperVox", name="two-stage-approach", config={
-        "binary_epochs": 5,    # Increase binary training
-        "diarizer_epochs": 5,  # Increase diarizer training
-        "batch_size": 4,
+        "binary_epochs": 20,   # Double training time
+        "diarizer_epochs": 20, # Double training time
+        "batch_size": 16,     # Larger batches
         "binary_lr": 5e-5,
         "diarizer_lr": 2e-5,
         "num_speakers": None
@@ -442,10 +442,10 @@ def main():
     # Load WhisperProcessor
     processor = WhisperProcessor.from_pretrained("openai/whisper-tiny.en")
     
-    # Load datasets (smaller subset for faster iteration)
+    # Load datasets (use full dataset)
     ds = load_dataset("diarizers-community/voxconverse")
-    train_subset = ds['dev'].select(range(20))  # First 20 files
-    val_subset = ds['test'].select(range(5))
+    train_subset = ds['dev']  # Full dev set
+    val_subset = ds['test']   # Full test set
     
     # Count speakers
     spk_set = set()
@@ -469,7 +469,8 @@ def main():
         binary_train_data, 
         batch_size=run.config.batch_size, 
         shuffle=True,
-        num_workers=2,
+        num_workers=8,
+        prefetch_factor=4,  # Increase prefetching
         pin_memory=True
     )
     
@@ -477,7 +478,8 @@ def main():
         binary_val_data, 
         batch_size=run.config.batch_size, 
         shuffle=False,
-        num_workers=2,
+        num_workers=8,
+        prefetch_factor=4,  # Add prefetching
         pin_memory=True
     )
     
@@ -520,7 +522,8 @@ def main():
         diarizer_train_data, 
         batch_size=run.config.batch_size, 
         shuffle=True,
-        num_workers=2,
+        num_workers=8,
+        prefetch_factor=4,  # Add prefetching
         pin_memory=True
     )
     
@@ -528,7 +531,8 @@ def main():
         diarizer_val_data, 
         batch_size=run.config.batch_size, 
         shuffle=False,
-        num_workers=2,
+        num_workers=8,
+        prefetch_factor=4,  # Add prefetching
         pin_memory=True
     )
     
