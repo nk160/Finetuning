@@ -117,7 +117,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, device, scaler, run):
     total_loss = 0
     optimizer.zero_grad()
     torch.cuda.empty_cache()
-    torch.cuda.set_per_process_memory_fraction(0.75)  # Limit GPU memory usage
+    torch.cuda.set_per_process_memory_fraction(0.75)
     for i, batch in enumerate(tqdm(loader, desc="Train")):
         feats = batch["input_features"].to(device)
         mask = batch["attention_mask"].to(device)
@@ -125,20 +125,15 @@ def train_one_epoch(model, loader, optimizer, scheduler, device, scaler, run):
         with torch.amp.autocast(device_type='cuda'):
             logits = model(feats, mask)
             probs = logits.sigmoid()
-            labels_cpu = labels.cpu()
-            probs_cpu = probs.cpu()
-            pt = torch.where(labels_cpu == 1, probs_cpu, 1 - probs_cpu)
-            focal_weight = (1 - pt) ** 2
+            pt = torch.where(labels == 1, probs, 1 - probs)
+            focal_weight = (1 - pt) ** 2  # Back to quadratic
             loss_bce = torch.nn.functional.binary_cross_entropy_with_logits(
                 logits, 
                 labels, 
                 reduction='none',
-                pos_weight=torch.ones(run.config.num_speakers, device=device) * 2.0
+                pos_weight=torch.ones(run.config.num_speakers, device=device) * 3.0
             )
             loss = (loss_bce * focal_weight).mean()
-            l1_lambda = 0.01
-            l1_reg = sum(p.abs().sum() for p in model.classifier.parameters())
-            loss = loss + l1_lambda * l1_reg
         scaler.scale(loss / ACCUMULATION_STEPS).backward()
         total_loss += loss.item()
         run.log({"batch_loss": loss.item()})
@@ -165,7 +160,7 @@ def validate(model, loader, device):
             mask = batch["attention_mask"].to(device)
             labels = batch["labels"].float().to(device)
             logits = model(feats, mask).sigmoid()
-            preds = (logits > 0.5).cpu().numpy()
+            preds = (logits > 0.35).cpu().numpy()  # Much lower threshold
             refs = labels.cpu().numpy()
             fa = np.sum((preds == 1) & (refs == 0))
             miss = np.sum((preds == 0) & (refs == 1))
@@ -184,7 +179,7 @@ def validate(model, loader, device):
 
 def main():
     run = wandb.init(project="WhisperVox", config={
-        "epochs": 15,
+        "epochs": 25,
         "batch_size": 64,  # Further reduce batch size
         "lr": 3e-5,
         "warmup_steps": 100,
@@ -198,9 +193,9 @@ def main():
     processor = WhisperProcessor.from_pretrained("openai/whisper-tiny.en")
     whisper_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny.en")
 
-    # Freeze entire Whisper encoder except final layers if desired
-    for param in whisper_model.model.encoder.parameters():
-        param.requires_grad = False
+    # Partially unfreeze more Whisper layers
+    for i, param in enumerate(whisper_model.model.encoder.parameters()):
+        param.requires_grad = (i > len(list(whisper_model.model.encoder.parameters())) - 4)
 
     # Load dataset
     ds = load_dataset("diarizers-community/voxconverse")
@@ -227,17 +222,21 @@ def main():
     val_loader = DataLoader(val_data, batch_size=run.config.batch_size, shuffle=False)
 
     model = DiarizationModel(whisper_model, run.config.num_speakers).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=run.config.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4)  # Higher LR
     scheduler = OneCycleLR(
         optimizer,
-        max_lr=run.config.lr * 2,  # Double peak learning rate
+        max_lr=5e-4 * 2,
         epochs=run.config.epochs,
         steps_per_epoch=len(train_loader),
-        pct_start=0.1,  # Warmup for 10% of training
-        div_factor=25.0,  # Initial lr = max_lr/25
-        final_div_factor=1000.0  # Final lr = max_lr/1000
+        pct_start=0.2,  # Longer warmup
+        div_factor=10.0,  # Less aggressive LR reduction
     )
     scaler = torch.amp.GradScaler()
+
+    # Partially freeze LSTM layers
+    for name, param in model.temporal.named_parameters():
+        if 'weight_hh' in name:  # Freeze recurrent weights
+            param.requires_grad = False
 
     for epoch in range(run.config.epochs):
         train_loss = train_one_epoch(model, train_loader, optimizer, scheduler, device, scaler, run)
