@@ -425,6 +425,7 @@ class ResidualConvBlock(torch.nn.Module):
         self.conv2 = torch.nn.Conv1d(channels, channels, 3, padding=1)
         self.norm1 = torch.nn.GroupNorm(8, channels)
         self.norm2 = torch.nn.GroupNorm(8, channels)
+        self.batch_norm = torch.nn.BatchNorm1d(channels)
         self.dropout = torch.nn.Dropout(0.2)
     
     def forward(self, x):
@@ -437,7 +438,8 @@ class ResidualConvBlock(torch.nn.Module):
         x = self.norm2(x)
         x = torch.nn.functional.gelu(x)
         x = self.dropout(x)
-        return x + residual
+        x = self.batch_norm(x + residual)
+        return x
 
 def train_epoch(model, train_loader, optimizer, scheduler, device, scaler, run):
     """Train one epoch of the diarization model"""
@@ -469,12 +471,13 @@ def train_epoch(model, train_loader, optimizer, scheduler, device, scaler, run):
                 # Add focal term
                 probs = outputs['speaker_logits'].sigmoid()
                 pt = torch.where(speaker_labels == 1, probs, 1 - probs)
-                focal_weight = (1 - pt) ** 2
+                focal_weight = (1 - pt) ** 3  # Increase focus on hard examples
+                class_weight = torch.where(speaker_labels == 1, 5.0, 1.0)  # Increase positive class weight
                 
                 # Compute loss components
-                bce_loss = (bce * focal_weight).mean()
-                sparsity_loss = 0.3 * probs.mean()
-                l2_loss = 0.01 * sum(p.pow(2.0).sum() for p in model.parameters())
+                bce_loss = (bce * focal_weight * class_weight).mean()
+                sparsity_loss = 0.05 * probs.mean()  # Reduce sparsity penalty
+                l2_loss = 0.001 * sum(p.pow(2.0).sum() for p in model.parameters())
                 
                 # Combined loss
                 loss = bce_loss + sparsity_loss + l2_loss
@@ -485,6 +488,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, device, scaler, run):
             # Gradient clipping
             if (batch_idx + 1) % accumulation_steps == 0:
                 scaler.unscale_(optimizer)
+                # Add gradient value clipping
+                torch.nn.utils.clip_grad_value_(model.parameters(), 1.0)
                 grad_norm = clip_grad_norm_(model.parameters(), max_grad_norm)
                 
                 # Log gradient norm
@@ -665,7 +670,8 @@ def setup_training(config):
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config["learning_rate"],
-        weight_decay=0.01
+        weight_decay=0.01,
+        eps=1e-8  # Add epsilon for stability
     )
     
     return model, processor, optimizer
@@ -734,17 +740,15 @@ def main():
         config={
             "dataset": "voxconverse",
             "model_type": "tiny.en",
-            "batch_size": 32,  # Increase from 16
-            "learning_rate": 5e-5,  # Slightly increase learning rate to compensate
+            "batch_size": 32,
+            "learning_rate": 1e-4,  # Slightly higher initial LR
             "epochs": 1,
             "max_audio_length": 30,
             "sampling_rate": 16000,
-            "num_speakers": None,  # Will be set from dataset
+            "num_speakers": None,
             "patience": 1,
             "debug": True,
-            "diarization_weight": 1.0,
-            "max_grad_norm": 1.0,
-            "warmup_steps": 100,
+            "warmup_steps": 50,  # Shorter warmup since we only have 1 epoch
             "val_every_n_steps": 500,
             "gradient_accumulation_steps": 4
         }
